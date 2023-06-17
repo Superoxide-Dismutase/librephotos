@@ -195,14 +195,11 @@ class Photo(models.Model):
             if commit:
                 self.save()
             util.logger.info(
-                "saved captions for image %s. caption: %s"
-                % (image_path, caption)
+                "saved captions for image %s. caption: %s" % (image_path, caption)
             )
             return True
         except Exception:
-            util.logger.warning(
-                "could not save captions for image %s" % image_path
-            )
+            util.logger.warning("could not save captions for image %s" % image_path)
             return False
 
     def _generate_clip_embeddings(self, commit=True):
@@ -518,8 +515,12 @@ class Photo(models.Model):
         (video_length,) = get_metadata(
             self.main_file.path, tags=[Tags.QUICKTIME_DURATION], try_sidecar=True
         )
-        logger.debug(f"Extracted rating for {self.main_file.path}: {video_length}")
-        self.video_length = video_length
+        logger.debug(
+            f"Extracted video length for {self.main_file.path}: {video_length}"
+        )
+        if video_length and isinstance(video_length, numbers.Number):
+            self.video_length = video_length
+
         if commit:
             self.save()
 
@@ -567,7 +568,7 @@ class Photo(models.Model):
             self.shutter_speed = str(Fraction(shutter_speed).limit_denominator(1000))
         if camera and isinstance(camera, str):
             self.camera = camera
-        if lens and isinstance(camera, str):
+        if lens and isinstance(lens, str):
             self.lens = lens
         if width and isinstance(width, numbers.Number):
             self.width = width
@@ -596,27 +597,94 @@ class Photo(models.Model):
                 self.save(save_metadata=False)
 
     def _extract_faces(self, second_try=False):
+        qs_unknown_person = api.models.person.Person.objects.filter(
+            Q(name="unknown") | Q(name=api.models.person.Person.UNKNOWN_PERSON_NAME)
+        )
+        if qs_unknown_person.count() == 0:
+            unknown_person = api.models.person.get_unknown_person(owner=self.owner)
+        else:
+            unknown_person = qs_unknown_person[0]
+
+        unknown_cluster: api.models.cluster.Cluster = (
+            api.models.cluster.get_unknown_cluster(user=self.owner)
+        )
+
+        (region_info,) = get_metadata(
+            self.main_file.path, tags=[Tags.REGION_INFO], try_sidecar=True, struct=True
+        )
+
+        if region_info:
+            logger.debug(f"Extracted region_info for {self.main_file.path}")
+            # Log region_info
+            logger.debug(f"region_info: {region_info}")
+            # Extract faces
+            for region in region_info["RegionList"]:
+                if region["Type"] != "Face":
+                    continue
+                # Find person with the name of the region with get_or_create
+                person = api.models.person.get_or_create_person(
+                    name=region["Name"], owner=self.owner
+                )
+                person.save()
+                # Create face from the region infos
+                image = np.array(PIL.Image.open(self.thumbnail_big.path))
+                if region["Area"]["Unit"] == "normalized":
+                    image_width = image.shape[1]
+                    image_height = image.shape[0]
+                    area = region["Area"]
+                    # Calculate the half-width and half-height of the box
+                    half_width = area["W"] * image_width / 2
+                    half_height = area["H"] * image_height / 2
+
+                    # Calculate the top, right, bottom, and left coordinates
+                    top = int((area["Y"] * image_height) - half_height)
+                    right = int((area["X"] * image_width) + half_width)
+                    bottom = int((area["Y"] * image_height) + half_height)
+                    left = int((area["X"] * image_width) - half_width)
+
+                face_image = image[top:bottom, left:right]
+                face_image = PIL.Image.fromarray(face_image)
+
+                # Figure out which face idx it is, but reading the number of the faces of the person
+                idx_face = api.models.face.Face.objects.filter(person=person).count()
+                image_path = self.image_hash + "_" + str(idx_face) + ".jpg"
+
+                import face_recognition
+
+                face_encodings = face_recognition.face_encodings(
+                    image, known_face_locations=[(top, right, bottom, left)]
+                )
+
+                face = api.models.face.Face(
+                    image_path=image_path,
+                    photo=self,
+                    location_top=top,
+                    location_right=bottom,
+                    location_bottom=left,
+                    location_left=right,
+                    encoding=face_encodings[0].tobytes().hex(),
+                    person=person,
+                    cluster=unknown_cluster,
+                )
+                face_io = BytesIO()
+                face_image.save(face_io, format="JPEG")
+                face.image.save(face.image_path, ContentFile(face_io.getvalue()))
+                face_io.close()
+                face.save()
+                logger.debug(f"Created face {face} from {self.main_file.path}")
+            return
+
         import face_recognition
 
         try:
-            qs_unknown_person = api.models.person.Person.objects.filter(
-                Q(name="unknown") | Q(name=api.models.person.Person.UNKNOWN_PERSON_NAME)
-            )
-            if qs_unknown_person.count() == 0:
-                unknown_person = api.models.person.get_unknown_person(owner=self.owner)
-            else:
-                unknown_person = qs_unknown_person[0]
-
-            unknown_cluster: api.models.cluster.Cluster = (
-                api.models.cluster.get_unknown_cluster(user=self.owner)
-            )
             image = np.array(PIL.Image.open(self.thumbnail_big.path))
 
             face_locations = []
+            # Create
             try:
                 face_locations = face_recognition.face_locations(image)
             except Exception:
-                logger.debug(
+                logger.info(
                     f"Can't extract face information on photo: {self.main_file.path}"
                 )
 
