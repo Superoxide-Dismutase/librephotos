@@ -20,13 +20,25 @@ def create_thumbnail():
     except Exception:
         return "", 400
     log(f"creating for source={source} height={height}")
-    with Image(filename=source) as img:
-        with img.clone() as thumbnail:
-            thumbnail.format = "webp"
-            thumbnail.transform(resize=f"x{height}")
-            thumbnail.compression_quality = 95
-            thumbnail.auto_orient()
-            thumbnail.save(filename=destination)
+    with Image() as img:
+        img.options['dng:read-thumbnail']='true'
+        img.read(filename=source)
+        try:
+            with Image(blob=img.profiles['dng:thumbnail']) as preview_img:
+                with preview_img.clone() as thumbnail:
+                    thumbnail.format = "webp"
+                    thumbnail.transform(resize=f"x{height}")
+                    thumbnail.compression_quality = 95
+                    thumbnail.auto_orient()
+                    thumbnail.save(filename=destination)
+        except Exception as e:
+            log(f"generate thumbnail from raw preview failed with error {e}, use original raw instead")
+            with img.clone() as thumbnail:
+                thumbnail.format = "webp"
+                thumbnail.transform(resize=f"x{height}")
+                thumbnail.compression_quality = 95
+                thumbnail.auto_orient()
+                thumbnail.save(filename=destination)
     log(f"created at location={destination}")
     return {"thumbnail": destination}, 201
 
